@@ -269,22 +269,14 @@ class LLMConfigGUI(
 
         self.page.on_keyboard_event = on_keyboard
 
-        # 窗口关闭时自动保存平台配置
-        def on_window_event(e):
-            if e.data == "close":
-                try:
-                    self.save_platform_config(silent=True)
-                except Exception:
-                    pass
-                if hasattr(self.page, "window") and self.page.window:
-                    self.page.window.destroy()
+        # 监听断开或关闭事件（纯数据层静默保存兜底）
+        def on_disconnect(e):
+            try:
+                self.save_platform_config(silent=True, skip_ui_update=True)
+            except Exception:
+                pass
 
-        if hasattr(self.page, "window") and self.page.window:
-            self.page.window.prevent_close = True
-            self.page.window.on_event = on_window_event
-
-        import atexit
-        atexit.register(lambda: getattr(self, "save_platform_config", lambda silent=True: None)(silent=True))
+        self.page.on_disconnect = on_disconnect
 
         # 1. 顶部 Header
         header = self._build_header()
@@ -1131,10 +1123,20 @@ def main(*, schema_initializer: Optional[Callable[[AIManager], None]] = None):
     """主函数：启动 Flet GUI。"""
     enable_high_dpi_awareness()
 
+    gui_instance = None
+
     def app_main(page: ft.Page):
-        LLMConfigGUI(page, schema_initializer=schema_initializer)
+        nonlocal gui_instance
+        gui_instance = LLMConfigGUI(page, schema_initializer=schema_initializer)
 
     ft.app(target=app_main)
+
+    # 窗口关闭后 ft.app() 正常返回退出，此时尽力保存一次（纯数据层操作，无 UI 阻塞）
+    if gui_instance is not None:
+        try:
+            gui_instance.save_platform_config(silent=True, skip_ui_update=True)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

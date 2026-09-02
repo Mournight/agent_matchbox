@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+import hashlib
+import json
 from typing import Any, Dict, Mapping, Optional
 
 from langchain_core.outputs import ChatGenerationChunk
@@ -13,19 +16,96 @@ from .reasoning_compat import (
     extract_reasoning_text_from_chat_delta,
     extract_reasoning_text_from_message,
 )
+from .request_headers import build_upstream_request_headers
+from .tool_protocol import validate_tool_message_history
 
 
-def _normalize_json_schema_required(schema: Any) -> Any:
-    """递归补齐对象 Schema 的 ``required`` 数组。"""
-    if isinstance(schema, list):
-        return [_normalize_json_schema_required(item) for item in schema]
+def _prompt_cache_agent_name(callbacks: Any) -> str:
+    for callback in list(callbacks or []):
+        agent_name = str(getattr(callback, "agent_name", "") or "").strip()
+        if agent_name:
+            return agent_name
+    return ""
+
+
+def build_prompt_cache_routing_key(llm: Any) -> str | None:
+    """为支持改进匹配的 OpenAI 模型生成隔离、稳定且不泄露身份的路由键。"""
+    model_name = str(
+        getattr(llm, "model_name", "")
+        or getattr(llm, "model", "")
+        or ""
+    ).strip().lower()
+    if not model_name.startswith("gpt-5.6"):
+        return None
+
+    try:
+        from core.request_context import (
+            current_user_id,
+            get_current_chat_session,
+            get_current_project_name,
+        )
+
+        user_id = str(current_user_id.get() or "").strip()
+        project_name = str(get_current_project_name() or "").strip()
+        room_agent_id, context_key = get_current_chat_session()
+    except Exception:
+        return None
+
+    agent_name = _prompt_cache_agent_name(getattr(llm, "callbacks", None))
+    if not user_id or not agent_name:
+        return None
+
+    identity = json.dumps(
+        {
+            "version": 1,
+            "user_id": user_id,
+            "project_name": project_name,
+            "room_agent_id": room_agent_id or "",
+            "context_key": context_key or "",
+            "agent_name": agent_name,
+            "model_name": model_name,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:40]
+    return f"sparkarc:v1:{digest}"
+
+
+def _normalize_openai_compat_json_schema(schema: Any) -> Any:
+    """递归收敛工具 Schema，并补齐对象的 ``required`` 数组。
+
+    ``examples`` 是标准 JSON Schema 注释，但不属于 Gemini
+    ``FunctionDeclaration.parameters`` 接受的 Schema 字段。部分 OpenAI 兼容
+    代理会把工具声明直接转换成 Gemini Schema，因而会让整个请求在生成前以
+    ``INVALID_ARGUMENT`` 失败。单数 ``example`` 属于 Gemini Schema，继续保留。
+    """
     if not isinstance(schema, dict):
-        return schema
+        return deepcopy(schema)
 
-    normalized = {
-        key: _normalize_json_schema_required(value)
-        for key, value in schema.items()
-    }
+    normalized = {}
+    schema_maps = {"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"}
+    schema_values = {"items", "contains", "additionalProperties", "propertyNames", "not", "if", "then", "else"}
+    schema_lists = {"anyOf", "oneOf", "allOf", "prefixItems"}
+    for key, value in schema.items():
+        if key == "examples":
+            continue
+        if key in schema_maps and isinstance(value, dict):
+            # 映射键是参数名或定义名，必须原样保留，即使恰好叫 examples。
+            normalized[key] = {
+                name: _normalize_openai_compat_json_schema(child)
+                for name, child in value.items()
+            }
+        elif key in schema_values and isinstance(value, dict):
+            normalized[key] = _normalize_openai_compat_json_schema(value)
+        elif key in schema_lists and isinstance(value, list):
+            normalized[key] = [
+                _normalize_openai_compat_json_schema(child)
+                for child in value
+            ]
+        else:
+            normalized[key] = deepcopy(value)
     is_object_schema = (
         normalized.get("type") == "object"
         or isinstance(normalized.get("properties"), dict)
@@ -40,7 +120,8 @@ def normalize_openai_tool_schemas(tools: Any) -> Any:
 
     OpenAI 兼容实现通常允许对象 Schema 省略 ``required``，但部分提供商会把
     缺失值按 ``null`` 校验并拒绝请求。空数组仍属于标准 JSON Schema，因此可在
-    统一协议层安全补齐，无需按模型名称或端点域名建立供应商分支。
+    统一协议层安全补齐。纯注释字段 ``examples`` 会被部分 Gemini 代理当作未知
+    字段拒绝，统一移除也不会改变参数校验语义。这里不按模型名称或端点域名分支。
     """
     if not isinstance(tools, list):
         return tools
@@ -57,7 +138,7 @@ def normalize_openai_tool_schemas(tools: Any) -> Any:
             normalized_function = dict(function)
             parameters = function.get("parameters")
             if isinstance(parameters, dict):
-                normalized_function["parameters"] = _normalize_json_schema_required(parameters)
+                normalized_function["parameters"] = _normalize_openai_compat_json_schema(parameters)
             normalized_tool["function"] = normalized_function
         normalized_tools.append(normalized_tool)
     return normalized_tools
@@ -81,7 +162,7 @@ def build_sdk_compat_headers(
     existing_headers: Optional[Mapping[str, str]] = None,
 ) -> Optional[Dict[str, str]]:
     """为 OpenAI 兼容网关构建请求头。"""
-    headers = dict(existing_headers or {})
+    headers = build_upstream_request_headers(existing_headers)
 
     if not _env_flag_enabled("AGENT_MATCHBOX_OPENAI_COMPAT_OVERRIDE_UA", default=True):
         return headers or None
@@ -146,6 +227,10 @@ class ChatUniversal(ChatOpenAI):
         **kwargs: Any,
     ) -> dict:
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        if "prompt_cache_key" not in payload:
+            prompt_cache_key = build_prompt_cache_routing_key(self)
+            if prompt_cache_key:
+                payload["prompt_cache_key"] = prompt_cache_key
         if "tools" in payload:
             payload["tools"] = normalize_openai_tool_schemas(payload.get("tools"))
 
@@ -163,6 +248,8 @@ class ChatUniversal(ChatOpenAI):
             reasoning = extract_metadata_reasoning_text_from_message(source_message)
             if reasoning:
                 payload_message["reasoning_content"] = reasoning
+
+        validate_tool_message_history(payload_messages)
 
         return payload
 

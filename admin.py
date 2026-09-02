@@ -21,6 +21,7 @@ from .models import (
     is_chat_model,
     is_embedding_model,
     is_image_generation_model,
+    model_sort_key,
     normalize_model_modalities,
     set_model_modalities,
 )
@@ -32,6 +33,7 @@ from .image_adapters import (
 )
 from .security import SecurityManager
 from .utils import normalize_base_url, normalize_recharge_url
+from .platform_identity import generate_platform_key, normalize_platform_key
 
 
 def _parse_extra_body_raw(extra_body_str: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -120,13 +122,67 @@ def _model_payload_for_response(model: LLModels) -> Dict[str, Any]:
         "sys_credit_input_price_per_million": model.sys_credit_input_price_per_million,
         "sys_credit_cached_input_price_per_million": model.sys_credit_cached_input_price_per_million,
         "sys_credit_output_price_per_million": model.sys_credit_output_price_per_million,
+        "sort_order": model.sort_order,
     }
+
+
+def _models_in_sort_order(models: List[LLModels]) -> List[LLModels]:
+    """按持久化排序返回模型，并用数据库 ID 解决历史并列值。"""
+    return sorted(models or [], key=model_sort_key)
 
 
 class AdminMixin:
     """平台与模型管理功能 (Admin)"""
 
     # ==================== 平台管理 ====================
+
+    @staticmethod
+    def _find_active_platform_with_name(
+        session,
+        *,
+        name: str,
+        exclude_platform_id: Optional[int] = None,
+    ) -> Optional[LLMPlatform]:
+        """查找仍在使用中的同名平台；已禁用记录不再占用名称。"""
+        filters = [
+            LLMPlatform.name == name,
+            LLMPlatform.disable == 0,
+        ]
+        if exclude_platform_id is not None:
+            filters.append(LLMPlatform.id != exclude_platform_id)
+        return (
+            session.query(LLMPlatform)
+            .filter(*filters)
+            .order_by(LLMPlatform.id)
+            .first()
+        )
+
+    @staticmethod
+    def _find_disabled_platform_for_revival(
+        session,
+        *,
+        name: str,
+        base_url: str,
+        is_sys: bool,
+        user_id: Optional[str] = None,
+    ) -> Optional[LLMPlatform]:
+        """按平台类型、归属、名称和规范化 URL 精确查找可复活的平台。"""
+        filters = [
+            LLMPlatform.name == name,
+            LLMPlatform.base_url == base_url,
+            LLMPlatform.disable == 1,
+            LLMPlatform.is_sys == int(is_sys),
+        ]
+        if not is_sys:
+            if user_id is None:
+                return None
+            filters.append(LLMPlatform.user_id == str(user_id))
+        return (
+            session.query(LLMPlatform)
+            .filter(*filters)
+            .order_by(LLMPlatform.id)
+            .first()
+        )
 
     def _describe_secret_state(self, raw_value: Optional[str], *, audience: str = "generic") -> Dict[str, Any]:
         text = raw_value.strip() if isinstance(raw_value, str) else ""
@@ -259,6 +315,7 @@ class AdminMixin:
         api_key: Optional[str] = None,
         user_id: str = None,
         recharge_url: Optional[str] = None,
+        platform_key: Optional[str] = None,
     ):
         self._ensure_mutable()
         if not (name and base_url):
@@ -269,31 +326,59 @@ class AdminMixin:
         user_id = str(user_id)
         base_url = normalize_base_url(base_url)
         recharge_url = normalize_recharge_url(recharge_url)
+        supplied_platform_key = normalize_platform_key(platform_key)
+        platform_key = supplied_platform_key or generate_platform_key()
         
         if api_key:
             api_key = SecurityManager.get_instance().encrypt(api_key)
         
         with self.Session() as session:
-            # 复活同 base_url 的已禁用自定义平台（避免重复建垃圾数据）
-            existing_same_url = session.query(LLMPlatform).filter_by(base_url=base_url, user_id=user_id, is_sys=0).first()
-            if existing_same_url and existing_same_url.disable:
-                existing_same_url.name = name
-                existing_same_url.api_key = api_key
-                existing_same_url.recharge_url = recharge_url
-                existing_same_url.disable = 0
+            existing_key = session.query(LLMPlatform).filter_by(platform_key=platform_key).first()
+            if existing_key:
+                if not supplied_platform_key or existing_key.is_sys or existing_key.user_id != user_id or not existing_key.disable:
+                    raise ValueError(f"platform_key '{platform_key}' 已存在")
+                existing_name = self._find_active_platform_with_name(
+                    session,
+                    name=name,
+                    exclude_platform_id=existing_key.id,
+                )
+                if existing_name:
+                    raise ValueError(f"平台名称 '{name}' 已存在")
+                existing_key.name = name
+                existing_key.base_url = base_url
+                existing_key.api_key = api_key
+                existing_key.recharge_url = recharge_url
+                existing_key.disable = 0
                 session.commit()
-                return existing_same_url
+                return existing_key
 
-            # 平台名称全局唯一性检查（仅检查未禁用的平台）
-            if name in DEFAULT_PLATFORM_CONFIGS or session.query(LLMPlatform).filter_by(name=name, disable=0).first():
+            # 活动平台名称全局唯一；活动记录优先于历史禁用记录。
+            if self._find_active_platform_with_name(session, name=name):
                 raise ValueError(f"平台名称 '{name}' 已存在（系统预设或已被其他用户使用）")
-            
-            # 允许与系统平台 base_url 重复，但不允许与用户自己的其他自定义平台重复
-            if session.query(LLMPlatform).filter_by(base_url=base_url, user_id=user_id, is_sys=0).first():
-                raise ValueError("您已创建过使用该base_url的平台")
-            
+
+            # 未提供稳定身份时，仅复活同名、同 URL 的禁用自定义平台。
+            if not supplied_platform_key:
+                revived = self._find_disabled_platform_for_revival(
+                    session,
+                    name=name,
+                    base_url=base_url,
+                    is_sys=False,
+                    user_id=user_id,
+                )
+                if revived:
+                    revived.api_key = api_key
+                    revived.recharge_url = recharge_url
+                    revived.disable = 0
+                    session.commit()
+                    return revived
+
+            # 平台名称全局唯一；平台身份由新生成的 key 区分。
+            if name in DEFAULT_PLATFORM_CONFIGS:
+                raise ValueError(f"平台名称 '{name}' 已存在（系统预设或已被其他用户使用）")
+
             p = LLMPlatform(
                 name=name,
+                platform_key=platform_key,
                 base_url=base_url,
                 recharge_url=recharge_url,
                 api_key=api_key,
@@ -358,24 +443,14 @@ class AdminMixin:
             # 名称全局唯一性检查（排除自己）
             if new_name in DEFAULT_PLATFORM_CONFIGS:
                 raise ValueError("平台名称与系统平台冲突")
-            existing_name = session.query(LLMPlatform).filter(
-                LLMPlatform.name == new_name,
-                LLMPlatform.disable == 0,
-                LLMPlatform.id != platform_id
-            ).first()
+            existing_name = self._find_active_platform_with_name(
+                session,
+                name=new_name,
+                exclude_platform_id=platform_id,
+            )
             if existing_name:
                 raise ValueError(f"平台名称 '{new_name}' 已被使用")
                 
-            # base_url 唯一性检查（排除自己，仅用户自定义平台）
-            existing_url = session.query(LLMPlatform).filter(
-                LLMPlatform.base_url == new_base_url,
-                LLMPlatform.user_id == user_id,
-                LLMPlatform.is_sys == 0,
-                LLMPlatform.id != platform_id
-            ).first()
-            if existing_url:
-                raise ValueError("您已有一个使用该 base_url 的平台")
-            
             plat.name = new_name
             plat.base_url = new_base_url
             if update_recharge_url:
@@ -472,6 +547,7 @@ class AdminMixin:
             views.append(
                 {
                     "platform_id": plat.id,
+                    "platform_key": plat.platform_key,
                     "name": plat.name,
                     "base_url": plat.base_url,
                     "recharge_url": plat.recharge_url,
@@ -489,7 +565,9 @@ class AdminMixin:
                     "user_key_status": user_key_info["status"],
                     "user_key_message": user_key_info["message"],
                     "disabled": int(bool(plat.disable) or bool(user_disable)),
-                    "models": [m for m in plat.models if not self._is_model_disabled(m)],
+                    "models": _models_in_sort_order(
+                        [m for m in plat.models if not self._is_model_disabled(m)]
+                    ),
                 }
             )
 
@@ -507,6 +585,7 @@ class AdminMixin:
             views.append(
                 {
                     "platform_id": plat.id,
+                    "platform_key": plat.platform_key,
                     "name": plat.name,
                     "base_url": plat.base_url,
                     "recharge_url": plat.recharge_url,
@@ -519,7 +598,9 @@ class AdminMixin:
                     "user_key_override": False,
                     "user_key_saved": False,
                     "disabled": plat.disable,
-                    "models": [m for m in plat.models if not self._is_model_disabled(m)],
+                    "models": _models_in_sort_order(
+                        [m for m in plat.models if not self._is_model_disabled(m)]
+                    ),
                 }
             )
 
@@ -533,6 +614,7 @@ class AdminMixin:
             return [
                 {
                     "platform_id": view["platform_id"],
+                    "platform_key": view.get("platform_key"),
                     "name": view["name"],
                     "base_url": view["base_url"],
                     "recharge_url": view.get("recharge_url"),
@@ -568,6 +650,7 @@ class AdminMixin:
                     continue
                 results.append({
                     "platform_id": view["platform_id"],
+                    "platform_key": view.get("platform_key"),
                     "name": view["name"],
                     "base_url": view["base_url"],
                     "recharge_url": view.get("recharge_url"),
@@ -598,6 +681,7 @@ class AdminMixin:
             return [
                 {
                     "platform_id": view["platform_id"],
+                    "platform_key": view.get("platform_key"),
                     "platform_name": view["name"],
                     "platform_is_sys": view["is_sys"],
                     "platform_disabled": view["disabled"],
@@ -645,6 +729,7 @@ class AdminMixin:
                     continue
                 results.append({
                     "platform_id": view["platform_id"],
+                    "platform_key": view.get("platform_key"),
                     "name": view["name"],
                     "base_url": view["base_url"],
                     "recharge_url": view.get("recharge_url"),
@@ -1130,7 +1215,7 @@ class AdminMixin:
             query = session.query(LLMPlatform).filter_by(is_sys=1)
             if not include_disabled:
                 query = query.filter(LLMPlatform.disable == 0)
-            platforms = query.order_by(LLMPlatform.sort_order).all()
+            platforms = query.order_by(LLMPlatform.sort_order, LLMPlatform.id).all()
 
             sec_mgr = SecurityManager.get_instance()
             results = []
@@ -1151,6 +1236,7 @@ class AdminMixin:
 
                 entry: Dict[str, Any] = {
                     "platform_id": plat.id,
+                    "platform_key": plat.platform_key,
                     "name": plat.name,
                     "base_url": plat.base_url,
                     "recharge_url": plat.recharge_url,
@@ -1168,7 +1254,7 @@ class AdminMixin:
                     # 返回完整模型列表，GUI 用此替代直接 session.query
                     entry["api_key"] = api_key_raw
                     models_list = []
-                    for m in sorted(plat.models, key=lambda x: x.sort_order):
+                    for m in _models_in_sort_order(plat.models):
                         raw_extra_body = None
                         if m.extra_body:
                             try:
@@ -1209,6 +1295,7 @@ class AdminMixin:
         api_key: Optional[str] = None,
         sys_credit_balance: Optional[float] = None,
         recharge_url: Optional[str] = None,
+        platform_key: Optional[str] = None,
     ) -> LLMPlatform:
         """
         添加系统平台（管理员专用）
@@ -1219,34 +1306,58 @@ class AdminMixin:
         
         base_url = normalize_base_url(base_url)
         recharge_url = normalize_recharge_url(recharge_url)
+        supplied_platform_key = normalize_platform_key(platform_key)
+        platform_key = supplied_platform_key or generate_platform_key()
         
         with self.Session() as session:
-            # 同 base_url 的系统平台若已存在且被禁用，则复活
-            existing_url = session.query(LLMPlatform).filter_by(base_url=base_url, is_sys=1).first()
-            if existing_url and existing_url.disable:
-                existing_url.name = name
-                existing_url.disable = 0
-                existing_url.recharge_url = recharge_url
-                existing_url.sys_credit_balance = _normalize_nullable_credit_balance(sys_credit_balance)
+            # 只有调用方明确提供原 platform_key 时才允许复活已禁用平台。
+            existing_key = session.query(LLMPlatform).filter_by(platform_key=platform_key).first()
+            if existing_key:
+                if not supplied_platform_key or not (existing_key.is_sys and existing_key.disable):
+                    raise ValueError(f"platform_key '{platform_key}' 已存在")
+                existing_name = self._find_active_platform_with_name(
+                    session,
+                    name=name,
+                    exclude_platform_id=existing_key.id,
+                )
+                if existing_name:
+                    raise ValueError(f"平台名称 '{name}' 已存在")
+                existing_key.name = name
+                existing_key.base_url = base_url
+                existing_key.disable = 0
+                existing_key.recharge_url = recharge_url
+                existing_key.sys_credit_balance = _normalize_nullable_credit_balance(sys_credit_balance)
                 if api_key:
-                    existing_url.api_key = SecurityManager.get_instance().encrypt(api_key)
+                    existing_key.api_key = SecurityManager.get_instance().encrypt(api_key)
                 session.commit()
-
                 with self._cache_lock:
                     self._sys_platforms_cache = None
+                return existing_key
 
-                return existing_url
-
-            # 检查名称是否已存在（仅检查未禁用的平台）
-            existing_name = session.query(LLMPlatform).filter_by(name=name, disable=0).first()
-            if existing_name:
+            # 活动平台名称全局唯一；活动记录优先于历史禁用记录。
+            if self._find_active_platform_with_name(session, name=name):
                 raise ValueError(f"平台名称 '{name}' 已存在")
-            
-            # 检查 base_url 是否已存在于系统平台
-            existing_url = session.query(LLMPlatform).filter_by(base_url=base_url, is_sys=1).first()
-            if existing_url:
-                raise ValueError(f"已存在使用该 base_url 的系统平台: {existing_url.name}")
-            
+
+            # 未提供稳定身份时，仅复活同名、同 URL 的禁用系统平台。
+            if not supplied_platform_key:
+                revived = self._find_disabled_platform_for_revival(
+                    session,
+                    name=name,
+                    base_url=base_url,
+                    is_sys=True,
+                )
+                if revived:
+                    revived.disable = 0
+                    revived.recharge_url = recharge_url
+                    revived.sys_credit_balance = _normalize_nullable_credit_balance(sys_credit_balance)
+                    if api_key:
+                        revived.api_key = SecurityManager.get_instance().encrypt(api_key)
+                    session.commit()
+                    with self._cache_lock:
+                        self._sys_platforms_cache = None
+                    return revived
+
+            # 相同 URL 允许对应多个平台。
             # 加密 API Key
             encrypted_key = None
             if api_key:
@@ -1254,6 +1365,7 @@ class AdminMixin:
             
             plat = LLMPlatform(
                 name=name,
+                platform_key=platform_key,
                 base_url=base_url,
                 recharge_url=recharge_url,
                 api_key=encrypted_key,
@@ -1289,26 +1401,18 @@ class AdminMixin:
                 raise ValueError("系统平台不存在")
             
             if new_name is not None:
-                # 检查名称唯一性（仅检查未禁用的平台）
-                existing = session.query(LLMPlatform).filter(
-                    LLMPlatform.name == new_name,
-                    LLMPlatform.disable == 0,
-                    LLMPlatform.id != platform_id
-                ).first()
+                # 检查名称全局唯一性
+                existing = self._find_active_platform_with_name(
+                    session,
+                    name=new_name,
+                    exclude_platform_id=platform_id,
+                )
                 if existing:
                     raise ValueError(f"平台名称 '{new_name}' 已被使用")
                 plat.name = new_name
             
             if new_base_url is not None:
                 new_base_url = normalize_base_url(new_base_url)
-                # 检查 base_url 唯一性（仅系统平台）
-                existing = session.query(LLMPlatform).filter(
-                    LLMPlatform.base_url == new_base_url,
-                    LLMPlatform.is_sys == 1,
-                    LLMPlatform.id != platform_id
-                ).first()
-                if existing:
-                    raise ValueError(f"已存在使用该 base_url 的系统平台: {existing.name}")
                 plat.base_url = new_base_url
 
             if update_sys_credit_balance:
@@ -1367,7 +1471,7 @@ class AdminMixin:
                 session.query(LLMPlatform)
                 .filter_by(is_sys=1)
                 .filter(LLMPlatform.disable == 0)
-                .order_by(LLMPlatform.sort_order)
+                .order_by(LLMPlatform.sort_order, LLMPlatform.id)
                 .all()
             )
 
@@ -1382,20 +1486,7 @@ class AdminMixin:
 
             session.commit()
 
-            # 更新运行时默认 ID
-            self._default_platform_id = platform_id
-            first_model = next(
-                (
-                    model for model in session.query(LLModels)
-                    .filter(LLModels.platform_id == platform_id, LLModels.disable == 0)
-                    .order_by(LLModels.sort_order)
-                    .all()
-                    if is_chat_model(model)
-                ),
-                None,
-            )
-            if first_model:
-                self._default_model_id = first_model.id
+            self._refresh_runtime_default_ids(session)
 
             # 刷新缓存
             with self._cache_lock:
@@ -1415,6 +1506,8 @@ class AdminMixin:
                     plat.sort_order = idx
             session.commit()
 
+            self._refresh_runtime_default_ids(session)
+
             with self._cache_lock:
                 self._sys_platforms_cache = None
 
@@ -1433,6 +1526,8 @@ class AdminMixin:
                 if model:
                     model.sort_order = idx
             session.commit()
+
+            self._refresh_runtime_default_ids(session)
 
             with self._cache_lock:
                 self._sys_platforms_cache = None

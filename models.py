@@ -21,6 +21,8 @@ from sqlalchemy.orm import (
     relationship,
 )
 
+from .platform_identity import generate_platform_key
+
 Base = declarative_base()
 
 
@@ -136,8 +138,19 @@ def model_outputs(model, modality: str) -> bool:
     return str(modality).strip().lower() in get_model_modalities(model)["output_modalities"]
 
 
+def is_text_generation_model(model) -> bool:
+    """判断模型是否适合文本 Agent 的聊天/生成请求。"""
+    modalities = get_model_modalities(model)["output_modalities"]
+    return (
+        MODALITY_TEXT in modalities
+        and MODALITY_IMAGE not in modalities
+        and MODALITY_EMBEDDING not in modalities
+    )
+
+
 def is_chat_model(model) -> bool:
-    return model_outputs(model, MODALITY_TEXT)
+    """兼容旧名称；文本 Agent 不接受生图或 Embedding 模型。"""
+    return is_text_generation_model(model)
 
 
 def is_embedding_model(model) -> bool:
@@ -148,12 +161,30 @@ def is_image_generation_model(model) -> bool:
     return model_outputs(model, MODALITY_IMAGE)
 
 
+def model_sort_key(model) -> tuple[int, int]:
+    """返回模型排序键；以持久化顺序为主、数据库 ID 为稳定次序。"""
+    return (
+        int(getattr(model, "sort_order", 0) or 0),
+        int(getattr(model, "id", 0) or 0),
+    )
+
+
+def platform_sort_key(platform) -> tuple[int, int]:
+    """返回平台排序键；以持久化顺序为主、数据库 ID 为稳定次序。"""
+    return (
+        int(getattr(platform, "sort_order", 0) or 0),
+        int(getattr(platform, "id", 0) or 0),
+    )
+
+
 class LLMPlatform(Base):
     """LLM 平台模型"""
     __tablename__ = "llm_platforms"
     id = Column(Integer, primary_key=True)
     name = Column(String(80), default="未命名平台", index=True)
     user_id = Column(String(255), nullable=True, index=True)
+    # 平台身份与 base_url 解耦；base_url 可以被多个平台配置共享。
+    platform_key = Column(String(128), nullable=True, unique=True, default=generate_platform_key, index=True)
     base_url = Column(String(255), nullable=False)
     # 平台充值入口；为空时前端不显示低频充值按钮。
     recharge_url = Column(String(512), nullable=True)

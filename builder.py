@@ -29,13 +29,14 @@ from .models import (
     LLModels,
     UserModelUsage,
     AgentModelBinding,
-    UserEmbeddingSelection,
     DEFAULT_MAX_CONTEXT_TOKENS,
     DEFAULT_MAX_OUTPUT_TOKENS,
     get_model_modalities,
     is_chat_model,
     is_embedding_model,
     is_image_generation_model,
+    model_sort_key,
+    platform_sort_key,
 )
 from .config import SYSTEM_USER_ID, DEFAULT_USAGE_KEY
 from .image_adapters import (
@@ -95,7 +96,14 @@ class LLMBuilderMixin:
         if self._default_platform_id and self._default_model_id:
             plat = session.query(LLMPlatform).filter_by(id=self._default_platform_id).first()
             model = session.query(LLModels).filter_by(id=self._default_model_id).first()
-            if plat and model and not self._is_platform_disabled(session, user_id, plat) and not self._is_model_disabled(model):
+            if (
+                plat
+                and model
+                and model.platform_id == plat.id
+                and is_chat_model(model)
+                and not self._is_platform_disabled(session, user_id, plat)
+                and not self._is_model_disabled(model)
+            ):
                 return plat, model
         
         # 兜底：按 sort_order 查询第一个可用的系统平台和模型
@@ -103,19 +111,49 @@ class LLMBuilderMixin:
             session.query(LLMPlatform)
             .filter_by(is_sys=1)
             .filter(LLMPlatform.disable == 0)
-            .order_by(LLMPlatform.sort_order)
+            .order_by(LLMPlatform.sort_order, LLMPlatform.id)
             .all()
         )
         for plat in plats:
             if self._is_platform_disabled(session, user_id, plat):
                 continue
-            # 按 sort_order 排序获取第一个可用模型
-            sorted_models = sorted(plat.models, key=lambda m: m.sort_order)
-            for m in sorted_models:
-                if is_chat_model(m) and not self._is_model_disabled(m):
-                    return plat, m
+            model = self._get_first_available_chat_model(plat)
+            if model:
+                return plat, model
         
         raise RuntimeError("无法找到可用的默认平台和模型")
+
+    def _get_first_available_chat_model(self, platform: Optional[LLMPlatform]) -> Optional[LLModels]:
+        """返回平台内排序最靠前的可用文本模型。"""
+        if platform is None:
+            return None
+        models = sorted(
+            getattr(platform, "models", None) or [],
+            key=model_sort_key,
+        )
+        return next(
+            (
+                model
+                for model in models
+                if is_chat_model(model) and not self._is_model_disabled(model)
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _update_resolved_selection(
+        usage_slot: Optional[UserModelUsage],
+        binding: Optional[AgentModelBinding],
+        platform: LLMPlatform,
+        model: LLModels,
+    ) -> None:
+        """同步写回用途槽位或直接 Agent 绑定的最终模型。"""
+        if usage_slot is not None:
+            usage_slot.selected_platform_id = platform.id
+            usage_slot.selected_model_id = model.id
+        if binding is not None:
+            binding.platform_id = platform.id
+            binding.model_id = model.id
 
     def _resolve_user_choice(
         self,
@@ -124,6 +162,7 @@ class LLMBuilderMixin:
         platform_id: Optional[int],
         model_id: Optional[int],
         usage_slot: Optional[UserModelUsage] = None,
+        binding: Optional[AgentModelBinding] = None,
         auto_fix: bool = True,
         raise_on_missing_key: bool = True,
         platform_obj: Optional[LLMPlatform] = None,
@@ -150,48 +189,40 @@ class LLMBuilderMixin:
         if not plat or not model:
             if auto_fix:
                 plat, model = self._get_fallback_platform_model(session, user_id)
-                # 更新用途槽位
-                if usage_slot:
-                    usage_slot.selected_platform_id = plat.id
-                    usage_slot.selected_model_id = model.id
+                self._update_resolved_selection(usage_slot, binding, plat, model)
             else:
                 raise ValueError("平台或模型配置无效")
         
         # 确保模型属于该平台
         if model.platform_id != plat.id:
             if auto_fix:
-                # 尝试使用平台的第一个模型
-                if plat.models:
-                    model = next((m for m in plat.models if is_chat_model(m) and not self._is_model_disabled(m)), None)
-                    if not model:
-                        raise ValueError(f"平台 '{plat.name}' 没有可用的 LLM 模型")
-                    if usage_slot:
-                        usage_slot.selected_model_id = model.id
-                else:
-                    raise ValueError(f"平台 '{plat.name}' 没有可用模型")
+                model = self._get_first_available_chat_model(plat)
+                if model is None:
+                    plat, model = self._get_fallback_platform_model(session, user_id)
+                self._update_resolved_selection(usage_slot, binding, plat, model)
             else:
                 raise ValueError(f"模型 '{model.display_name}' 不属于平台 '{plat.name}'")
 
         # 防止非文本生成模型进入 LLM 解析
         if not is_chat_model(model):
             if auto_fix:
-                fallback = next((m for m in plat.models if is_chat_model(m) and not self._is_model_disabled(m)), None)
-                if not fallback:
-                    raise ValueError(f"平台 '{plat.name}' 没有可用的 LLM 模型")
-                model = fallback
-                if usage_slot:
-                    usage_slot.selected_model_id = model.id
+                fallback = self._get_first_available_chat_model(plat)
+                if fallback is None:
+                    plat, model = self._get_fallback_platform_model(session, user_id)
+                else:
+                    model = fallback
+                self._update_resolved_selection(usage_slot, binding, plat, model)
             else:
                 raise ValueError("该模型不可用于文本生成")
 
         if self._is_model_disabled(model):
             if auto_fix:
-                fallback = next((m for m in plat.models if is_chat_model(m) and not self._is_model_disabled(m)), None)
-                if not fallback:
-                    raise ValueError(f"平台 '{plat.name}' 没有可用的 LLM 模型")
-                model = fallback
-                if usage_slot:
-                    usage_slot.selected_model_id = model.id
+                fallback = self._get_first_available_chat_model(plat)
+                if fallback is None:
+                    plat, model = self._get_fallback_platform_model(session, user_id)
+                else:
+                    model = fallback
+                self._update_resolved_selection(usage_slot, binding, plat, model)
             else:
                 raise ValueError("模型已禁用")
         
@@ -262,6 +293,7 @@ class LLMBuilderMixin:
         
         direct_config = None
         normalized_usage = None
+        binding = None
 
         with self.Session() as session:
             self.ensure_user_has_config(session, effective_user_id)
@@ -308,6 +340,9 @@ class LLMBuilderMixin:
                     usage_slot = self._get_usage_slot(session, effective_user_id, normalized_usage)
                     platform_id = usage_slot.selected_platform_id
                     model_id = usage_slot.selected_model_id
+                    if binding and binding.target_type == 'direct':
+                        binding.platform_id = platform_id
+                        binding.model_id = model_id
             else:
                 usage_slot = self._get_usage_slot(session, effective_user_id, normalized_usage)
                 if not usage_slot:
@@ -324,6 +359,7 @@ class LLMBuilderMixin:
                 platform_id,
                 model_id,
                 usage_slot=usage_slot,
+                binding=binding if direct_config else None,
             )
 
             self.enforce_user_credit(
@@ -364,6 +400,7 @@ class LLMBuilderMixin:
                 quota_scope=quota_scope,
                 billing_enabled=self.billing_enabled,
                 usage_context_provider=getattr(self, "_usage_context_provider", None),
+                usage_recorded_handler=getattr(self, "_usage_recorded_handler", None),
             )
  
             # 构建 LLM 客户端（ChatUniversal 子类保留了第三方模型的 reasoning_content）
@@ -409,36 +446,34 @@ class LLMBuilderMixin:
         effective_user_id = user_id if user_id is not None else SYSTEM_USER_ID
 
         with self.Session() as session:
-            selection = None
-            if platform_id is None or model_id is None:
-                selection = session.query(UserEmbeddingSelection).filter_by(user_id=effective_user_id).first()
-                if selection:
-                    platform_id = selection.platform_id
-                    model_id = selection.model_id
+            if platform_id is not None and model_id is not None:
+                plat = session.query(LLMPlatform).filter_by(id=platform_id).first()
+                model = session.query(LLModels).filter_by(id=model_id).first()
+                resolved = {
+                    "platform": plat,
+                    "model": model,
+                    "api_key": self._get_effective_api_key(session, effective_user_id, plat)
+                    if plat
+                    else None,
+                }
+            else:
+                resolved = self._resolve_user_embedding_selection(session, effective_user_id)
 
-            plat = session.query(LLMPlatform).filter_by(id=platform_id).first() if platform_id else None
-            model = session.query(LLModels).filter_by(id=model_id).first() if model_id else None
+            plat = resolved["platform"]
+            model = resolved["model"]
+            api_key = resolved["api_key"]
 
-            if not plat or not model or not is_embedding_model(model):
-                # 回退：找第一个可用的 embedding
-                plat = None
-                model = None
-                platforms = session.query(LLMPlatform).all()
-                for p in platforms:
-                    for m in p.models:
-                        if is_embedding_model(m) and not self._is_model_disabled(m):
-                            api_key = self._get_effective_api_key(session, effective_user_id, p)
-                            if api_key:
-                                plat = p
-                                model = m
-                                break
-                    if plat and model:
-                        break
-
-            if not plat or not model:
+            if (
+                not plat
+                or not model
+                or model.platform_id != plat.id
+                or not is_embedding_model(model)
+                or self._is_model_disabled(model)
+                or (not plat.is_sys and str(plat.user_id) != str(effective_user_id))
+                or self._is_platform_disabled(session, effective_user_id, plat)
+            ):
                 raise ValueError("未找到可用的 Embedding 模型或未配置 API Key")
 
-            api_key = self._get_effective_api_key(session, effective_user_id, plat)
             if not api_key:
                 raise ValueError(f"平台 '{plat.name}' 的 API Key 未设置。")
 
@@ -465,14 +500,14 @@ class LLMBuilderMixin:
                 session.query(LLMPlatform)
                 .all()
             )
-            for platform in sorted(platforms, key=lambda item: int(getattr(item, "sort_order", 0) or 0)):
+            for platform in sorted(platforms, key=platform_sort_key):
                 if self._is_platform_disabled(session, effective_user_id, platform):
                     continue
                 if not platform.is_sys and str(platform.user_id) != effective_user_id:
                     continue
 
                 api_access = self._get_effective_api_access(session, effective_user_id, platform)
-                models = sorted(platform.models, key=lambda item: int(getattr(item, "sort_order", 0) or 0))
+                models = sorted(platform.models, key=model_sort_key)
                 for model in models:
                     if self._is_model_disabled(model) or not is_image_generation_model(model):
                         continue
@@ -524,7 +559,7 @@ class LLMBuilderMixin:
                     session.query(LLMPlatform)
                     .all()
                 )
-                for candidate_platform in sorted(platforms, key=lambda item: int(getattr(item, "sort_order", 0) or 0)):
+                for candidate_platform in sorted(platforms, key=platform_sort_key):
                     if self._is_platform_disabled(session, effective_user_id, candidate_platform):
                         continue
                     if not candidate_platform.is_sys and str(candidate_platform.user_id) != effective_user_id:
@@ -532,7 +567,7 @@ class LLMBuilderMixin:
                     api_access = self._get_effective_api_access(session, effective_user_id, candidate_platform)
                     if not api_access.get("api_key"):
                         continue
-                    for candidate_model in sorted(candidate_platform.models, key=lambda item: int(getattr(item, "sort_order", 0) or 0)):
+                    for candidate_model in sorted(candidate_platform.models, key=model_sort_key):
                         if self._is_model_disabled(candidate_model):
                             continue
                         if is_image_generation_model(candidate_model):
@@ -624,6 +659,8 @@ class LLMBuilderMixin:
             ).first()
             if not model:
                 raise ValueError(f"模型 '{model_display_name}' 在平台 '{platform_name}' 中不存在")
+            if not is_chat_model(model):
+                raise ValueError(f"模型 '{model_display_name}' 不具备文本生成能力")
 
             api_access = self._get_effective_api_access(session, effective_user_id, plat)
             api_key = api_access.get("api_key")
@@ -658,6 +695,7 @@ class LLMBuilderMixin:
                 quota_scope=quota_scope,
                 billing_enabled=self.billing_enabled,
                 usage_context_provider=getattr(self, "_usage_context_provider", None),
+                usage_recorded_handler=getattr(self, "_usage_recorded_handler", None),
             )
  
             llm = ChatUniversal(
